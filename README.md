@@ -52,9 +52,9 @@ docs/
   02-server-setup.md        Domain/Cloudflare, Nginx, tunnel, SSL, hardening, app migration, auth
   03-fail2ban.md            fail2ban concepts and SSH/Nginx jail configuration
 config/
-  nginx/site.conf.example         Hardened Nginx reverse-proxy config
-  fail2ban/jail.local.example     SSH + Nginx jail overrides
-  systemd/nhm.service.example     Hardened systemd unit for the backend
+  nginx/site.conf.md          Hardened Nginx reverse-proxy config
+  fail2ban/jail.local.md      SSH + Nginx jail overrides
+  systemd/nhm.service.md      Hardened systemd unit for the backend
 ```
 
 ## Current state
@@ -73,3 +73,4 @@ config/
 The live domain, internal IPs, and usernames have been replaced with placeholders (`nethealth.example.com`, `192.168.x.x`, `youruser`). No tokens, certificates, or secrets are included — those paths are referenced but their contents are never committed.
 
 ---
+
