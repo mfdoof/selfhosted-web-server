@@ -1,0 +1,972 @@
+# Network Health Manager — Server Setup Documentation
+
+## Overview
+
+The Network Health Manager (NHM) is a FastAPI/Uvicorn backend paired with a React + Vite frontend. It provides ping, port scanning, DNS lookup, and AI-powered analysis via Ollama. This document covers the full server-side setup required to expose the app from a homelab Ubuntu Server VM to the internet securely.
+
+## Infrastructure Constraints
+
+- **ISP:** A CGNAT provider — no public IP, no inbound port forwarding possible
+- **Hypervisor:** Proxmox with GPU passthrough (GTX 1650)
+- **Solution:** Cloudflare Tunnel bypasses CGNAT entirely — no open inbound ports required
+
+## Architecture
+
+```
+Browser → Cloudflare Edge (Hong Kong) → cloudflared tunnel → Nginx :80/:443
+                                                                  ├── location /        → /var/www/nethealth.example.com/ (React static files)
+                                                                  └── location /api/    → Uvicorn :8000 (FastAPI)
+                                                                                              └── Ollama :11434 (locked to 127.0.0.1)
+```
+
+## Stack
+
+| Component | Role |
+|---|---|
+| Ubuntu Server 24.04 | Host OS on Proxmox VM |
+| Nginx | Reverse proxy + static file server |
+| cloudflared | Outbound tunnel to Cloudflare |
+| Certbot (snap) | SSL certificate management via DNS challenge |
+| Fail2ban | Brute force and abuse protection |
+| UFW | Host firewall |
+| FastAPI / Uvicorn | Python API backend, port 8000 |
+| Ollama | Local LLM inference, locked to 127.0.0.1:11434 |
+| React + Vite | Frontend, built to `/var/www/nethealth.example.com/` |
+
+---
+
+## Phase 0 — Domain and Cloudflare Setup
+
+Register a domain and delegate DNS management to Cloudflare. Required for Cloudflare Tunnel to route public traffic to the server and for the DNS challenge used in Certbot (Phase 3).
+
+### Step 0.1 — Buy a domain
+
+**What:** Purchase a domain from a registrar.
+**Why:** Cloudflare Tunnel requires a domain to create a public hostname. A cheap TLD is sufficient — the domain does not need to be memorable.
+
+- Registrar used: Porkbun
+- Domain registered: `nethealth.example.com`
+- Note: First year cost $1.54, renewal is $12.98/year — a promotional price. `.xyz` TLDs renew cheaper (~$1–2/year) if cost is a concern in future.
+
+### Step 0.2 — Create a Cloudflare account and add the domain
+
+Add `nethealth.example.com` to Cloudflare using "Connect a domain". Cloudflare becomes the DNS authority for the domain, enabling tunnel routing, SSL management, and DDoS protection.
+
+- Selected "Import DNS records automatically" — safe default for a fresh domain
+- Selected "Block AI crawlers on all pages" — no reason to allow training bots on a network tool
+
+### Step 0.3 — Delete default Porkbun DNS records
+
+**What:** Removed all 4 records Cloudflare imported from Porkbun: two A records pointing to Porkbun's parking servers and two CNAME wildcards.
+
+These records pointed the domain at Porkbun's infrastructure. Leaving them would conflict with the tunnel's DNS record created in Phase 2. A clean DNS zone ensures every record is intentional.
+
+### Step 0.4 — Point Porkbun nameservers to Cloudflare
+
+Replaced Porkbun's four default nameservers with Cloudflare's two. Nameservers define who controls DNS for a domain. Pointing them at Cloudflare transfers DNS authority so Cloudflare can manage all records, including the tunnel CNAME created automatically in Phase 2.
+
+- Removed all four Porkbun nameservers
+- Added only Cloudflare's two assigned nameservers
+- DNSSEC confirmed off on both Porkbun and registry level before switching
+
+### Step 0.5 — Confirm propagation
+
+Wait for DNS propagation and Cloudflare activation email. Nameserver changes take time to propagate globally. The domain is not active on Cloudflare until propagation completes.
+
+Verify from the server:
+
+```bash
+dig NS nethealth.example.com
+```
+
+Expected: Cloudflare nameservers in the answer section.
+
+---
+
+## Phase 1 — Nginx Installation and Configuration
+
+Install Nginx on the Ubuntu VM and configure it as a reverse proxy that forwards API traffic to Uvicorn and serves the React frontend directly as static files.
+
+### Step 1.1 — Update the system
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+### Step 1.2 — Install Nginx
+
+```bash
+sudo apt install nginx -y
+```
+
+### Step 1.3 — Enable and verify Nginx
+
+```bash
+sudo systemctl enable nginx
+sudo systemctl start nginx
+sudo systemctl status nginx
+```
+
+Expected: `active (running)`
+
+### Step 1.4 — Fix server_tokens in nginx.conf
+
+Ubuntu's default `nginx.conf` ships with `server_tokens build` in the http block — this exposes the version number plus build details. Set it globally to off before creating any site config.
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+Change `server_tokens build` to `server_tokens off` in the http block.
+
+### Step 1.5 — Create the web root directory
+
+Nginx serves the built React frontend from `/var/www/nethealth.example.com/`. This directory must be owned by `www-data` so Nginx can read it and the deploy script can write to it.
+
+```bash
+sudo mkdir -p /var/www/nethealth.example.com
+sudo chown www-data:www-data /var/www/nethealth.example.com
+sudo chmod 755 /var/www/nethealth.example.com
+```
+
+### Step 1.6 — Create the site configuration
+
+```bash
+sudo nano /etc/nginx/sites-available/nethealth.example.com
+```
+
+Initial config (pre-SSL, pre-hardening):
+
+```nginx
+server {
+    listen 80;
+    server_name nethealth.example.com;
+
+    root /var/www/nethealth.example.com;
+    index index.html;
+
+    # Serve React frontend — fallback to index.html for client-side routing
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Proxy API requests to Uvicorn
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+**Config notes:**
+
+- `root /var/www/nethealth.example.com` — where the built React app lives after `deploy.sh` runs
+- `try_files $uri $uri/ /index.html` — required for React Router; falls back to `index.html` so client-side routes work on refresh
+- `location /api/` — all FastAPI routes are prefixed with `/api/` via `APIRouter(prefix="/api")` in `main.py`
+- `server_name nethealth.example.com` only — do not add `www.nethealth.example.com` unless a cert is obtained for it
+
+### Step 1.7 — Disable the default Nginx site
+
+The default site (`/etc/nginx/sites-enabled/default`) catches all requests that don't match a server_name. Remove it to prevent unintended public exposure.
+
+```bash
+sudo rm /etc/nginx/sites-enabled/default
+```
+
+### Step 1.8 — Enable the site
+
+```bash
+sudo ln -s /etc/nginx/sites-available/nethealth.example.com /etc/nginx/sites-enabled/
+```
+
+### Step 1.9 — Test and reload
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+## Phase 2 — Cloudflare Tunnel
+
+Install and configure `cloudflared` to create a persistent outbound tunnel from the VM to Cloudflare's edge network. This bypasses CGNAT — no inbound ports are opened, no public IP is needed.
+
+### Step 2.1 — Create the tunnel in Cloudflare dashboard
+
+Navigate to Zero Trust → Networks → Tunnels → Create a tunnel.
+
+- Tunnel type: Cloudflared
+- Tunnel name: `nethealth-tunnel`
+
+### Step 2.2 — Install cloudflared on the VM
+
+Run the install command provided by the Cloudflare dashboard. Select Debian / 64-bit to match Ubuntu Server.
+
+Two commands provided by the dashboard:
+
+1. **Install cloudflared** — adds Cloudflare's GPG key and apt repository, installs the package
+2. **Install as service** — registers the tunnel token and installs `cloudflared` as a systemd service
+
+Run them in order. Do not use the "run tunnel (manual)" command — it does not survive reboots.
+
+> **Security:** The token embedded in the service install command grants access to your Cloudflare account. Never share it, paste it in a forum, or commit it to a repository. If exposed, delete the tunnel and create a new one to invalidate the token.
+
+### Step 2.3 — Add a route
+
+In the tunnel configuration, add a Public Hostname route:
+
+| Field | Value |
+|---|---|
+| Subdomain | (empty) |
+| Domain | nethealth.example.com |
+| Path | (empty) |
+| Service URL | http://localhost:80 |
+
+Cloudflare automatically creates the DNS CNAME record pointing `nethealth.example.com` to the tunnel UUID when the route is saved.
+
+> **Note:** The tunnel routes to `http://localhost:80` (HTTP, not HTTPS). The tunnel protocol itself is encrypted end to end — adding HTTPS on the localhost leg is redundant and causes TLS verification issues. Do not change this to port 443.
+
+### Step 2.4 — Verify the tunnel
+
+Tunnel status in dashboard should show: **Healthy**
+
+Visit `http://nethealth.example.com` in a browser. Expected at this stage: either a 404 (Nginx is up but the web root is empty) or a React page if the frontend has already been deployed. A 502 means the app is not running on port 8000.
+
+---
+
+## Phase 3 — Certbot and SSL
+
+Obtain a Let's Encrypt SSL certificate using DNS challenge (required due to CGNAT — port 80 is not publicly reachable from Let's Encrypt). Configure Nginx for HTTPS. Set Cloudflare to Full (strict) mode.
+
+### Step 3.1 — Create Cloudflare API token
+
+Go to Cloudflare dashboard → My Profile → API Tokens → Create Token.
+
+Use the **Edit zone DNS** template with these settings:
+
+- **Token name:** `certbot-nethealth.example.com`
+- **Permissions:** Zone / DNS / Edit
+- **Zone Resources:** Include → Specific zone → `nethealth.example.com`
+- **Client IP Filtering:** Leave empty — token must work from any IP for unattended renewal
+- **TTL:** No expiry — renewal runs unattended indefinitely
+
+> **Warning:** Do not set an expiry date. Certbot auto-renewal runs every 60–90 days with no human present. An expired token causes silent renewal failure.
+
+### Step 3.2 — Store the token securely
+
+```bash
+sudo mkdir -p /etc/letsencrypt/secrets
+sudo nano /etc/letsencrypt/secrets/cloudflare.ini
+```
+
+Contents:
+
+```ini
+dns_cloudflare_api_token = YOUR_TOKEN_HERE
+```
+
+Lock down permissions:
+
+```bash
+sudo chmod 600 /etc/letsencrypt/secrets/cloudflare.ini
+sudo chown root:root /etc/letsencrypt/secrets/cloudflare.ini
+```
+
+### Step 3.3 — Install Certbot and Cloudflare plugin
+
+```bash
+sudo snap install --classic certbot
+sudo ln -s /snap/bin/certbot /usr/local/bin/certbot
+sudo snap set certbot trust-plugin-with-root=ok
+sudo snap install certbot-dns-cloudflare
+```
+
+The `trust-plugin-with-root` flag is required because the DNS plugin needs root access to work within snap's sandboxing.
+
+### Step 3.4 — Request the certificate
+
+```bash
+sudo certbot certonly \
+  --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/secrets/cloudflare.ini \
+  -d nethealth.example.com
+```
+
+Certbot creates a DNS TXT record on `nethealth.example.com` via the Cloudflare API, waits for propagation, Let's Encrypt verifies it, then the record is deleted automatically.
+
+Certificate files will be at:
+
+- `/etc/letsencrypt/live/nethealth.example.com/fullchain.pem`
+- `/etc/letsencrypt/live/nethealth.example.com/privkey.pem`
+
+### Step 3.5 — Test auto-renewal
+
+```bash
+sudo certbot renew --dry-run
+```
+
+Must pass before proceeding. If this fails, renewal will fail silently in production.
+
+### Step 3.6 — Set Cloudflare SSL/TLS to Full (strict)
+
+Cloudflare dashboard → `nethealth.example.com` → SSL/TLS → Overview → **Full (strict)**
+
+Full (strict) requires a valid CA-issued certificate on the origin. The Let's Encrypt cert satisfies this. Do not use Cloudflare Origin CA cert — it only works with Full (not Strict).
+
+### Step 3.7 — Set minimum TLS version
+
+Cloudflare dashboard → SSL/TLS → Edge Certificates → Minimum TLS Version → **TLS 1.2**
+
+TLS 1.0 and 1.1 are deprecated since 2020 and have known vulnerabilities.
+
+> **Note:** Do not add a port 80 → 443 redirect in Nginx. Cloudflare handles HTTP→HTTPS at the edge. Adding a redirect in Nginx creates an infinite redirect loop because the tunnel sends HTTP to Nginx on port 80 — Nginx redirects to Cloudflare — Cloudflare sends HTTP again — repeat.
+
+---
+
+## Phase 4 — Server Hardening
+
+### Step 4.1 — UFW firewall
+
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow out 7844/tcp
+sudo ufw enable
+```
+
+Port 7844 outbound is required for `cloudflared`. All other inbound ports are denied by default.
+
+Verify:
+
+```bash
+sudo ufw status verbose
+```
+
+Expected output:
+
+```
+Status: active
+Default: deny (incoming), allow (outgoing)
+
+To                   Action    From
+--                   ------    ----
+22                   ALLOW IN  Anywhere
+80/tcp               ALLOW IN  Anywhere
+443/tcp              ALLOW IN  Anywhere
+7844/tcp             ALLOW OUT Anywhere
+```
+
+### Step 4.2 — Hardened Nginx configuration
+
+Replace the initial site config with the full hardened version at `/etc/nginx/sites-available/nethealth.example.com`.
+
+This config adds: rate limiting zones, direct IP access blocking, real IP resolution from the Cloudflare tunnel, security headers, the Cloudflare IP whitelist on port 443, and the SSL certificate block.
+
+```nginx
+limit_req_zone $binary_remote_addr zone=general:10m rate=30r/m;
+limit_req_zone $binary_remote_addr zone=expensive:10m rate=10r/m;
+
+# Block direct IP access — drops connection with no response
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name nethealth.example.com;
+
+    # Resolve real client IP from Cloudflare tunnel.
+    # The tunnel forwards requests from 127.0.0.1 — without this, all clients
+    # appear as 127.0.0.1, breaking rate limiting and fail2ban.
+    set_real_ip_from 127.0.0.1;
+    real_ip_header X-Forwarded-For;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Serve React frontend
+    root /var/www/nethealth.example.com;
+    index index.html;
+
+    location / {
+        limit_req zone=general burst=10 nodelay;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Expensive API routes — tighter rate limit
+    location ~ ^/api/(hosts/[^/]+/(scan|ping|analyze)|dns/(lookup|analyze))$ {
+        limit_req zone=expensive burst=5 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # All other API routes
+    location /api/ {
+        limit_req zone=general burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name nethealth.example.com;
+    server_tokens off;
+
+    ssl_certificate /etc/letsencrypt/live/nethealth.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/nethealth.example.com/privkey.pem;
+
+    # Allow tunnel
+    allow 127.0.0.1;
+
+    # Cloudflare IP whitelist — blocks non-Cloudflare traffic on port 443
+    allow 173.245.48.0/20;
+    allow 103.21.244.0/22;
+    allow 103.22.200.0/22;
+    allow 103.31.4.0/22;
+    allow 141.101.64.0/18;
+    allow 108.162.192.0/18;
+    allow 190.93.240.0/20;
+    allow 188.114.96.0/20;
+    allow 197.234.240.0/22;
+    allow 198.41.128.0/17;
+    allow 162.158.0.0/15;
+    allow 104.16.0.0/13;
+    allow 104.24.0.0/14;
+    allow 172.64.0.0/13;
+    allow 131.0.72.0/22;
+    deny all;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header X-Forwarded-For;
+
+    # Serve React frontend
+    root /var/www/nethealth.example.com;
+    index index.html;
+
+    location / {
+        limit_req zone=general burst=10 nodelay;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Expensive API routes — tighter rate limit
+    location ~ ^/api/(hosts/[^/]+/(scan|ping|analyze)|dns/(lookup|analyze))$ {
+        limit_req zone=expensive burst=5 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # All other API routes
+    location /api/ {
+        limit_req zone=general burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+**Rate limiting zones:**
+
+- `general` — 30 requests/minute, burst 10: applied to all routes
+- `expensive` — 10 requests/minute, burst 5: applied to scan, ping, analyze, and DNS routes
+
+**Why two port blocks (80 and 443):** The tunnel routes to port 80. Port 443 exists for direct HTTPS connections and carries the Cloudflare IP whitelist. Both blocks are needed. On CGNAT, no external traffic can reach port 443 directly anyway — the whitelist is defense in depth.
+
+Test and reload after saving:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Step 4.3 — Fail2ban Nginx jails
+
+Add to `/etc/fail2ban/jail.local` below the existing `[sshd]` block:
+
+```ini
+[nginx-http-auth]
+enabled = true
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 5
+bantime = 24h
+findtime = 600
+
+[nginx-limit-req]
+enabled = true
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 10
+bantime = 24h
+findtime = 600
+```
+
+Restart fail2ban and confirm all three jails are active:
+
+```bash
+sudo systemctl restart fail2ban
+sudo fail2ban-client status
+```
+
+Expected: `Jail list: nginx-http-auth, nginx-limit-req, sshd`
+
+### Step 4.4 — Verify security headers are active
+
+With the app running, confirm headers are being sent:
+
+```bash
+curl -I -H "Host: nethealth.example.com" http://127.0.0.1
+```
+
+Expected in response:
+
+```
+strict-transport-security: max-age=31536000
+x-frame-options: SAMEORIGIN
+x-content-type-options: nosniff
+```
+
+---
+
+## Phase 5 — App Migration
+
+Deploy the FastAPI backend and React frontend to the Ubuntu VM. By the end of this phase, the full application stack is running and publicly accessible at `https://nethealth.example.com`.
+
+### Step 5.1 — Install Node.js v22
+
+Node.js is required to build the React frontend. Install via the NodeSource repository to get a current version — Ubuntu's default apt package is outdated.
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install nodejs -y
+node --version   # should return v22.x.x
+```
+
+### Step 5.2 — Install Ollama
+
+Ollama runs the local LLM used for AI analysis. Install using the official installer:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+The installer registers Ollama as a systemd service. Confirm it started:
+
+```bash
+sudo systemctl status ollama
+```
+
+### Step 5.3 — Lock Ollama to localhost
+
+By default, Ollama may bind to `0.0.0.0`, exposing the API on all interfaces. Lock it to `127.0.0.1` so it is only accessible from the local machine.
+
+```bash
+sudo systemctl edit ollama
+```
+
+Add under `[Service]`:
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=127.0.0.1"
+```
+
+Apply and verify:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+ss -tlnp | grep 11434
+```
+
+Expected: `127.0.0.1:11434` — not `0.0.0.0:11434`.
+
+### Step 5.4 — Pull the Ollama model
+
+```bash
+ollama pull llama3.2
+ollama list
+```
+
+Expected: `llama3.2:latest` listed with size ~2.0 GB.
+
+### Step 5.5 — Clone the repository
+
+```bash
+cd ~
+git clone https://github.com/YOUR_USERNAME/network-health-manager.git
+cd network-health-manager
+```
+
+### Step 5.6 — Create the Python virtual environment
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Verify Uvicorn is available:
+
+```bash
+which uvicorn
+# Expected: /home/youruser/network-health-manager/venv/bin/uvicorn
+```
+
+### Step 5.7 — Configure the environment file
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set all required values. At minimum:
+
+```ini
+OLLAMA_MODEL=llama3.2
+```
+
+Lock down permissions — the `.env` file contains secrets and must not be world-readable:
+
+```bash
+chmod 600 .env
+```
+
+### Step 5.8 — Create the systemd service
+
+Create a systemd service so Uvicorn starts automatically on boot and restarts on failure.
+
+```bash
+sudo nano /etc/systemd/system/nhm.service
+```
+
+Contents:
+
+```ini
+[Unit]
+Description=Network Health Manager
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+User=youruser
+WorkingDirectory=/home/youruser/network-health-manager
+ExecStart=/home/youruser/network-health-manager/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/youruser/network-health-manager/.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/youruser/network-health-manager/logs
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Service notes:**
+
+- `After=ollama.service` and `Wants=ollama.service` — ensures Ollama is up before the app starts, since the analyze endpoints depend on it
+- `EnvironmentFile` — loads `.env` into the service environment so FastAPI picks up config values
+- `ProtectSystem=strict` and `ProtectHome=read-only` — systemd hardening; prevents the process from writing anywhere except the explicitly allowed `logs/` directory
+- `--host 127.0.0.1` — Uvicorn only listens on localhost; Nginx is the only entry point
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable nhm
+sudo systemctl start nhm
+sudo systemctl status nhm
+```
+
+Expected: `active (running)`
+
+### Step 5.9 — Build and deploy the frontend
+
+The `deploy.sh` script at the repo root handles the full frontend deployment: builds the React app, copies the output to the Nginx web root, and restarts the NHM service.
+
+```bash
+cat deploy.sh
+```
+
+Make it executable and symlink it for convenience:
+
+```bash
+chmod +x deploy.sh
+sudo ln -s /home/youruser/network-health-manager/deploy.sh /usr/local/bin/deploy-nhm
+```
+
+Run the first deployment:
+
+```bash
+deploy-nhm
+```
+
+This builds `client/dist/` and copies it to `/var/www/nethealth.example.com/`. After this completes, visiting `https://nethealth.example.com` should serve the React app.
+
+> **Note:** Run `deploy-nhm` after every pull that includes frontend changes. Backend-only changes only require `sudo systemctl restart nhm`.
+
+### Step 5.10 — Verify the full stack
+
+```bash
+# 1. Uvicorn is running on the correct address
+ss -tlnp | grep 8000
+# Expected: 127.0.0.1:8000
+
+# 2. Ollama is running and locked to localhost
+ss -tlnp | grep 11434
+# Expected: 127.0.0.1:11434
+
+# 3. NHM service is active
+sudo systemctl status nhm --no-pager
+
+# 4. API is responding
+curl http://127.0.0.1:8000/api/hosts
+# Expected: JSON response (empty list [] if no hosts added yet)
+
+# 5. Frontend is being served by Nginx
+curl -I http://127.0.0.1
+# Expected: 200 OK with content-type: text/html
+
+# 6. All services survive a reboot
+sudo reboot
+# After reboot, SSH back in and re-run checks 1–5
+```
+
+### Step 5.11 — Confirm CORS is set correctly
+
+The FastAPI app must only allow requests from the production domain. Verify the CORS config in `api/main.py`:
+
+```bash
+grep -n "allow_origins" ~/network-health-manager/api/main.py
+```
+
+Expected:
+
+```python
+allow_origins=["https://nethealth.example.com"],
+```
+
+`localhost:5173` must not be present in the production deployment. It is only used during local development.
+
+---
+
+## Phase 6 — Authentication (Cloudflare Access)
+
+Authentication is enforced at the Cloudflare edge using **Cloudflare Access** (Zero Trust), not at the application layer. Because all traffic reaches the origin through the tunnel, gating the public hostname with an Access policy means requests are authenticated *before* they ever hit Nginx or the FastAPI app. The app itself stays stateless — no login routes, sessions, or JWT handling to maintain.
+
+**Why edge auth over app-level auth here:**
+
+- The app is already tunnel-only (no public IP, no direct origin access), so the edge is the single entry point — the natural place to enforce identity.
+- No auth code to write, test, or keep patched in the app. One less attack surface in the codebase.
+- Access integrates with an identity provider and gives audit logs of who authenticated, for free.
+
+**Setup (Cloudflare dashboard → Zero Trust → Access):**
+
+1. **Add an Access application** of type *Self-hosted*, pointed at the public hostname (`nethealth.example.com`).
+2. **Define a policy** — e.g. `Allow` for a specific list of email addresses, or an identity-provider group. `<fill in your policy: allowed emails / IdP group>`
+3. **Choose a login method** — one-time email PIN is the simplest; an OAuth/SSO identity provider (Google, GitHub, etc.) is cleaner for repeat use.
+4. **Session duration** — set to taste (e.g. 24h) under the Access app settings.
+
+**Verification:**
+
+- Visiting the public hostname now redirects to the Cloudflare Access login screen before the app loads.
+- Authenticated requests carry a `Cf-Access-Jwt-Assertion` header. The app can optionally verify this header for defense in depth, but the edge policy is the enforcing layer.
+
+> **Note:** Access protects the *public hostname*. The origin still relies on the tunnel + Cloudflare IP whitelist (Phase 4) so the app is never reachable except through Cloudflare — meaning the Access policy can't be bypassed by hitting the origin directly.
+
+---
+
+## Key Files
+
+| File                                      | Purpose                                            |
+| ----------------------------------------- | -------------------------------------------------- |
+| `/etc/nginx/sites-available/nethealth.example.com`   | Nginx site config — static files + API proxy       |
+| `/etc/nginx/nginx.conf`                   | Global Nginx config — `server_tokens off` set here |
+| `/etc/letsencrypt/secrets/cloudflare.ini` | Cloudflare API token for Certbot renewal           |
+| `/etc/letsencrypt/live/nethealth.example.com/`       | SSL certificate files                              |
+| `/etc/fail2ban/jail.local`                | Fail2ban jail config — SSH and Nginx jails         |
+| `/etc/systemd/system/nhm.service`         | Systemd unit for Uvicorn                           |
+| `/var/www/nethealth.example.com/`                    | Built React frontend — served by Nginx             |
+| `/var/log/nginx/error.log`                | Nginx error log — monitored by fail2ban            |
+| `~/network-health-manager/.env`                         | Backend environment config — never commit          |
+| `~/network-health-manager/logs/app.log`                 | App log with rotation (5 MB, 3 backups)            |
+| `~/network-health-manager/deploy.sh`                    | Build + deploy script — symlinked to `deploy-nhm`  |
+
+---
+
+## Current State
+
+| Component | Status |
+|---|---|
+| Domain `nethealth.example.com` | Active on Cloudflare |
+| Nameservers | Pointing to Cloudflare |
+| DNSSEC | Off |
+| Minimum TLS Version | TLS 1.2 |
+| Nginx | Running — hardened config active |
+| Default Nginx site | Removed |
+| `server_tokens` | Off globally in `nginx.conf` |
+| Cloudflare Tunnel | Healthy — routing to `http://localhost:80` |
+| SSL Certificate | Issued (ECDSA) — valid until 2026-08-04, auto-renewal confirmed |
+| Cloudflare SSL mode | Full (strict) |
+| UFW | Active — ports 22, 80, 443 inbound; 7844 outbound |
+| Fail2ban | Active — `sshd`, `nginx-http-auth`, `nginx-limit-req` jails |
+| Rate limiting | Active at Nginx level — `general` and `expensive` zones |
+| Real IP resolution | Active — `set_real_ip_from 127.0.0.1` in both server blocks |
+| Cloudflare IP whitelist | Active on port 443 |
+| Ollama | Running — `llama3.2:latest` (2.0 GB), locked to `127.0.0.1:11434` |
+| FastAPI / Uvicorn | Running — `nhm.service` on `127.0.0.1:8000`, starts on boot |
+| React frontend | Deployed — served from `/var/www/nethealth.example.com/` by Nginx |
+| CORS | Set to `https://nethealth.example.com` only |
+| Reboot test | Passed — all services came back automatically |
+| Authentication | Active — Cloudflare Access policy on the public hostname |
+
+---
+
+## Troubleshooting
+
+### TKT-001 — Domain search showing premium/unavailable prices on Porkbun
+
+**Symptom:** Searching "xyz" on Porkbun returns results priced at thousands of dollars, all showing unavailable.
+
+**Cause:** Searched for the literal string "xyz" as a domain name. `xyz.com`, `xyz.xyz` etc. are already registered and listed on the aftermarket at premium prices.
+
+**Resolution:** Search for your intended domain name with `.xyz` as the TLD extension, not the extension itself. Example: `myproject.xyz` instead of `xyz`.
+
+---
+
+### TKT-002 — Cloudflare 2FA setup rejecting password
+
+**Symptom:** Cloudflare asking for current password during 2FA setup but not accepting GitHub password.
+
+**Cause:** Account was created via GitHub OAuth. Cloudflare never created a native password for the account, but the 2FA setup flow requires one.
+
+**Resolution:**
+
+1. Go to Cloudflare login page
+2. Click "Forgot password"
+3. Reset via email to create a Cloudflare-native password
+4. Use the new password in 2FA setup
+
+---
+
+### TKT-003 — 502 Bad Gateway on nethealth.example.com after tunnel setup
+
+**Symptom:** Visiting `nethealth.example.com` returns Cloudflare 502 error.
+
+**Cause:** Expected behavior before app migration. Nginx returns 502 because `proxy_pass` points to `127.0.0.1:8000` where no application is running yet.
+
+**Verification:**
+
+```bash
+sudo tail -f /var/log/nginx/access.log
+```
+
+If requests appear in the log, the tunnel and Nginx are working. The 502 is application layer, not infrastructure.
+
+**Resolution:** Resolves when the app is migrated and Uvicorn is running on port 8000.
+
+---
+
+### TKT-004 — server_tokens conflict between nginx.conf and site block
+
+**Symptom:** `nginx.conf` contains `server_tokens build` while site config has `server_tokens off`.
+
+**Cause:** Ubuntu's default Nginx package ships with a poorly written `nginx.conf` boilerplate. `server_tokens build` exposes version number plus build details.
+
+**Resolution:** Changed `server_tokens build` to `server_tokens off` in the http block of `nginx.conf`. The site block's `server_tokens off` is now redundant but harmless.
+
+---
+
+### TKT-005 — Infinite redirect loop on nethealth.example.com
+
+**Symptom:** `curl -IL https://nethealth.example.com` returns `Maximum (50) redirects followed`.
+
+**Cause:** Nginx port 80 block had `return 301 https://$host$request_uri`. Cloudflare sends HTTP to the tunnel, Nginx redirects to HTTPS, Cloudflare receives the redirect and sends HTTP again — infinite loop.
+
+**Cause of confusion:** Standard Nginx SSL setup includes this redirect. It is incorrect for Cloudflare Tunnel setups because Cloudflare handles HTTP→HTTPS at the edge. The tunnel always delivers HTTP to Nginx internally.
+
+**Resolution:** Removed the port 80 redirect block entirely. Cloudflare's Always Use HTTPS setting handles the redirect at the edge.
+
+---
+
+### TKT-006 — All client IPs showing as 127.0.0.1 in Nginx logs
+
+**Symptom:** Nginx error log shows `client: 127.0.0.1` for all requests. Rate limiting and fail2ban track all users as the same IP.
+
+**Cause:** Cloudflare Tunnel runs on the same machine and forwards requests from localhost. Nginx sees the tunnel's local address, not the real visitor IP. The real IP is passed in the `X-Forwarded-For` header by Cloudflare but Nginx was not configured to use it.
+
+**Resolution:** Added to both Nginx server blocks:
+
+```nginx
+set_real_ip_from 127.0.0.1;
+real_ip_header X-Forwarded-For;
+```
+
+Also added `allow 127.0.0.1` to the Cloudflare IP whitelist so the tunnel is not blocked before real IP resolution occurs.
+
+---
+
+### TKT-007 — Direct LAN IP access returning 200
+
+**Symptom:** 
+returns 200 OK — bypasses Cloudflare.
+
+**Cause:** Nginx default site (`/etc/nginx/sites-enabled/default`) was still active, catching all requests that don't match a server_name.
+
+**Resolution:**
+
+1. Removed default site: `sudo rm /etc/nginx/sites-enabled/default`
+2. Added `default_server` catch-all block returning 444 (no response) for direct IP access
+
+**Scope note:** On CGNAT, no external traffic can reach the server directly since there is no public IP. The LAN bypass is a local network issue only — not an internet-facing exposure.
+
+---
+
+### TKT-008 — Ping returning no results on Linux
+
+**Symptom:** Ping requests return empty or malformed results after migrating the app from macOS to the Ubuntu VM.
+
+**Cause:** The regex patterns in `api/ping.py` were written against macOS ping output format. Linux ping uses different output strings:
+
+| Field | macOS format | Linux format |
+|---|---|---|
+| Packets received | `packets received` | `received` |
+| Round-trip stats | `min/avg/max/stddev` | `rtt min/avg/max/mdev` |
+
+**Resolution:** Updated regex patterns in `api/ping.py` to match Linux ping output format. Both strings differ enough that macOS patterns silently fail to match on Linux, returning empty results rather than an error.
